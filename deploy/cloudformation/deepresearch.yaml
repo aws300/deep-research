@@ -1,0 +1,1650 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::LanguageExtensions
+Description: >
+  Deep Research on Amazon Bedrock AgentCore - one-click, region/account agnostic.
+  AgentCore harness (deep-research skill) + single MCP Gateway (Web Search connector, research Lambda,
+  streaming MCP server on AgentCore Runtime; MCP 2025-11-25 / 2026-07-28, SigV4), SQS + DynamoDB admission
+  control, ECS Fargate dispatcher, optional Valkey semantic merge cache, webhook / SNS callbacks.
+  No public endpoints: every entry point is the IAM-authenticated AgentCore Gateway. Artifacts and the
+  dispatcher image are pulled from Docker Hub (default aws300/deploy), so no local build or ECR is needed.
+
+# ==============================================================================
+# METADATA - Console parameter grouping
+# ==============================================================================
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W1030   # PrivateSubnetIds defaults to "" (only used with VpcId; enforced by the ExistingVpcNeedsSubnets rule)
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Stack Identity"
+        Parameters:
+          - ProjectName
+          - EnvironmentId
+      - Label:
+          default: "Artifacts (Docker Hub)"
+        Parameters:
+          - ArtifactRepository
+          - ArtifactVersion
+          - RegistryCredentialsSecretArn
+      - Label:
+          default: "Network (leave VpcId empty to create a VPC)"
+        Parameters:
+          - VpcId
+          - PrivateSubnetIds
+          - VpcCidr
+      - Label:
+          default: "Research Agent"
+        Parameters:
+          - ResearchModelId
+          - ThinkingBudgetTokens
+          - HarnessNetworkMode
+          - HarnessMemory
+      - Label:
+          default: "Capacity / Admission Control"
+        Parameters:
+          - MaxInflight
+          - SessionCreatePerSec
+          - DispatcherWorkers
+          - DispatcherDesiredCount
+          - GatewayRateLimitPerCallerRpm
+      - Label:
+          default: "Features"
+        Parameters:
+          - EnableSemanticCache
+          - CanonicalizerModelId
+          - EmbeddingModelId
+          - CreateMcpClientUser
+          - EnforceWebSearchRegion
+          - RetainDataOnDelete
+          - LogRetentionDays
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name Prefix"
+      EnvironmentId:
+        default: "Environment ID (e.g. prod, dev, 001)"
+      ArtifactRepository:
+        default: "Docker Hub repository"
+      ArtifactVersion:
+        default: "Artifact version"
+      RegistryCredentialsSecretArn:
+        default: "Registry credentials secret (optional)"
+      VpcId:
+        default: "Existing VPC ID (optional)"
+      PrivateSubnetIds:
+        default: "Existing private subnets with NAT egress (>= 2 AZs)"
+      VpcCidr:
+        default: "VPC CIDR (only when creating a VPC)"
+      ResearchModelId:
+        default: "Research model"
+      ThinkingBudgetTokens:
+        default: "Extended thinking budget (0 = off)"
+      HarnessNetworkMode:
+        default: "Harness network mode"
+      HarnessMemory:
+        default: "Harness memory"
+      MaxInflight:
+        default: "Max executing research tasks"
+      SessionCreatePerSec:
+        default: "New harness sessions per second"
+      DispatcherWorkers:
+        default: "Worker threads per dispatcher task"
+      DispatcherDesiredCount:
+        default: "Dispatcher tasks"
+      GatewayRateLimitPerCallerRpm:
+        default: "Gateway requests/min per IAM principal (0 = off)"
+      EnableSemanticCache:
+        default: "Semantic merge cache (Valkey)"
+      CanonicalizerModelId:
+        default: "Canonicalizer / judge model"
+      EmbeddingModelId:
+        default: "Embedding model"
+      CreateMcpClientUser:
+        default: "Create least-privilege MCP client IAM user + key"
+      EnforceWebSearchRegion:
+        default: "Only allow regions with the Web Search connector"
+      RetainDataOnDelete:
+        default: "Retain bucket + table on stack delete"
+      LogRetentionDays:
+        default: "Log retention (days)"
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Description: "Lower-case prefix for all resource names"
+    AllowedPattern: "^[a-z][a-z0-9]{1,15}$"
+    ConstraintDescription: "2-16 lower-case letters/digits, starting with a letter"
+    Default: "deepresearch"
+  EnvironmentId:
+    Type: String
+    Description: "Environment identifier appended to all resource names"
+    AllowedPattern: "^[a-z0-9]{1,8}$"
+    ConstraintDescription: "1-8 lower-case letters/digits"
+    Default: "prod"
+  ArtifactRepository:
+    Type: String
+    Description: "Docker Hub repository holding deepresearch-artifacts-<version> and deepresearch-app-<version>"
+    Default: "aws300/deploy"
+  ArtifactVersion:
+    Type: String
+    Description: "Version tag suffix of both images (changing it rolls out new code everywhere)"
+    AllowedPattern: "^[A-Za-z0-9._-]{1,64}$"
+    Default: "1.0.2"
+  RegistryCredentialsSecretArn:
+    Type: String
+    Description: 'Optional Secrets Manager ARN with {"username":"...","password":"<Docker Hub access token>"} to avoid anonymous pull rate limits'
+    Default: ""
+  VpcId:
+    Type: String
+    Description: "Existing VPC to use. Empty = create a VPC (2 AZ private subnets, 1 NAT gateway, S3/DynamoDB endpoints)"
+    Default: ""
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Description: "Required with VpcId: private subnet IDs in >= 2 AZs that have outbound internet (NAT)"
+    Default: ""
+  VpcCidr:
+    Type: String
+    Default: "10.90.0.0/16"
+    AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+\.0\/16$'
+  ResearchModelId:
+    Type: String
+    Description: "Bedrock model / inference profile for the research agent"
+    Default: "global.anthropic.claude-sonnet-4-6"
+  ThinkingBudgetTokens:
+    Type: String
+    Description: "Extended thinking budget (reasoning is streamed to clients). 0 disables"
+    AllowedValues: ["0", "1024", "2000", "3000", "5000", "8000"]
+    Default: "3000"
+  HarnessNetworkMode:
+    Type: String
+    Description: "PUBLIC (AgentCore-managed egress) or VPC (harness microVMs in the private subnets)"
+    AllowedValues: [PUBLIC, VPC]
+    Default: PUBLIC
+  HarnessMemory:
+    Type: String
+    AllowedValues: [managed, disabled]
+    Default: managed
+  MaxInflight:
+    Type: Number
+    Description: "Executing research tasks across all dispatchers (raise together with the quotas in docs/QUOTAS.md)"
+    Default: 100
+    MinValue: 1
+  SessionCreatePerSec:
+    Type: Number
+    Description: "Token bucket for new harness sessions (keep below the Runtime session creation quota, default 25)"
+    Default: 20
+    MinValue: 1
+  DispatcherWorkers:
+    Type: Number
+    Description: "Concurrent research tasks handled by one dispatcher task"
+    Default: 16
+    MinValue: 1
+    MaxValue: 64
+  DispatcherDesiredCount:
+    Type: Number
+    Description: "Number of dispatcher tasks (the DynamoDB admission counter is shared, so > 1 is safe)"
+    Default: 1
+    MinValue: 0
+    MaxValue: 100
+  GatewayRateLimitPerCallerRpm:
+    Type: Number
+    Default: 600
+    MinValue: 0
+  EnableSemanticCache:
+    Type: String
+    Description: "Merge semantically equivalent requests into one task (ElastiCache Serverless Valkey + VPC Lambda)"
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  CanonicalizerModelId:
+    Type: String
+    Default: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+  EmbeddingModelId:
+    Type: String
+    Default: "global.cohere.embed-v4:0"
+  CreateMcpClientUser:
+    Type: String
+    Description: "Create an IAM user limited to bedrock-agentcore:InvokeGateway and store its access key in Secrets Manager"
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  EnforceWebSearchRegion:
+    Type: String
+    Description: "The Web Search connector exists only in us-east-1, eu-west-1, ap-northeast-1"
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  RetainDataOnDelete:
+    Type: String
+    Description: "Keep the reports bucket and the tasks table when the stack is deleted"
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  LogRetentionDays:
+    Type: Number
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+    Default: 30
+
+# ==============================================================================
+# RULES - pre-flight parameter validation
+# ==============================================================================
+Rules:
+  WebSearchRegion:
+    RuleCondition: !Equals [!Ref EnforceWebSearchRegion, "true"]
+    Assertions:
+      - Assert: !Contains [["us-east-1", "eu-west-1", "ap-northeast-1"], !Ref "AWS::Region"]
+        AssertDescription: "The AgentCore Gateway Web Search connector is only available in us-east-1, eu-west-1 and ap-northeast-1"
+  ExistingVpcNeedsSubnets:
+    RuleCondition: !Not [!Equals [!Ref VpcId, ""]]
+    Assertions:
+      - Assert: !Not [!EachMemberEquals [!Ref PrivateSubnetIds, ""]]
+        AssertDescription: "PrivateSubnetIds is required when VpcId is set"
+
+Conditions:
+  CreateVpc: !Equals [!Ref VpcId, ""]
+  CacheEnabled: !Equals [!Ref EnableSemanticCache, "true"]
+  HarnessInVpc: !Equals [!Ref HarnessNetworkMode, VPC]
+  HarnessMemoryManaged: !Equals [!Ref HarnessMemory, managed]
+  HasRateLimit: !Not [!Equals [!Ref GatewayRateLimitPerCallerRpm, 0]]
+  CreateClientUser: !Equals [!Ref CreateMcpClientUser, "true"]
+  HasRegistryCredentials: !Not [!Equals [!Ref RegistryCredentialsSecretArn, ""]]
+  RetainData: !Equals [!Ref RetainDataOnDelete, "true"]
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # SECTION 1: NETWORK (only when VpcId is empty)
+  # Private subnets reach AWS APIs, Bedrock and Docker Hub through one NAT gateway.
+  # Nothing listens on a public address.
+  # ============================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Condition: CreateVpc
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateVpc
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-igw"
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 8, 12]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-public-a"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 8, 12]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-public-b"
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 8, 12]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-private-a"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 8, 12]]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-private-b"
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateVpc
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-nat"
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateVpc
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-nat"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-public-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-private-rt"
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # One SG for everything in the VPC: outbound only, plus Valkey (6379) between members.
+  ServiceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName}-${EnvironmentId} deep research (egress only, Valkey inside the group)"
+      VpcId: !If [CreateVpc, !Ref VPC, !Ref VpcId]
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Outbound to AWS APIs, Bedrock, Docker Hub"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${EnvironmentId}-service-sg"
+
+  ServiceSGValkeyIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ServiceSG
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6380
+      SourceSecurityGroupId: !Ref ServiceSG
+      Description: "Valkey from members of this group"
+
+  # ============================================================================
+  # SECTION 2: STATE - bucket, queues, table, topic, webhook secret
+  # ============================================================================
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: !If [RetainData, Retain, Delete]
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvironmentId}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 3
+      Tags:
+        - Key: Project
+          Value: !Sub "${ProjectName}-${EnvironmentId}"
+
+  BucketTlsOnly:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub "${Bucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  IntakeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${EnvironmentId}-intake-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  IntakeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${EnvironmentId}-intake"
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IntakeDLQ.Arn
+        maxReceiveCount: 50
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: !If [RetainData, Retain, Delete]
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${ProjectName}-${EnvironmentId}-tasks"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Sub "${ProjectName}-${EnvironmentId}"
+
+  TaskEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${EnvironmentId}-task-events"
+      KmsMasterKeyId: alias/aws/sns
+
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentId}/webhook-secret"
+      Description: "HMAC-SHA256 key for completion webhooks (header X-DeepResearch-Signature)"
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: secret
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # ============================================================================
+  # SECTION 3: SEMANTIC MERGE CACHE (optional) - ElastiCache Serverless Valkey
+  # No user group: access is limited to ServiceSG members, TLS is always on.
+  # ============================================================================
+  ValkeyCache:
+    Type: AWS::ElastiCache::ServerlessCache
+    Condition: CacheEnabled
+    Properties:
+      ServerlessCacheName: !Sub "${ProjectName}-${EnvironmentId}-valkey"
+      Engine: valkey
+      MajorEngineVersion: "8"
+      SecurityGroupIds: [!Ref ServiceSG]
+      SubnetIds: !If
+        - CreateVpc
+        - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        - !Ref PrivateSubnetIds
+      Tags:
+        - Key: Project
+          Value: !Sub "${ProjectName}-${EnvironmentId}"
+
+  ValkeySecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CacheEnabled
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentId}/valkey"
+      Description: "Valkey endpoint for the semantic merge cache (no AUTH; TLS + security group)"
+      SecretString: !Sub '{"host":"${ValkeyCache.Endpoint.Address}","port":"${ValkeyCache.Endpoint.Port}","tls":true}'
+
+  # ============================================================================
+  # SECTION 4: ARTIFACTS - copy the Docker Hub artifacts layer into the bucket
+  #   docker.io/<ArtifactRepository>:deepresearch-artifacts-<ArtifactVersion> is a FROM-scratch image
+  #   whose layer holds lambda.zip, live_runtime.zip, tools_schema.json and skills/. The copier
+  #   extracts it to s3://<bucket>/artifacts/<version>/ (old versions are removed after an update).
+  # ============================================================================
+  ArtifactCopierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${EnvironmentId}-artifacts"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ArtifactCopierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: artifacts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:DeleteObjectVersion]
+                Resource: !Sub "${Bucket.Arn}/*"
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:ListBucketVersions]
+                Resource: !GetAtt Bucket.Arn
+              - !If
+                - HasRegistryCredentials
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref RegistryCredentialsSecretArn
+                - !Ref AWS::NoValue
+              - Effect: Allow   # no logs:CreateLogGroup: the stack owns the group (no orphans after rollback/delete)
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ArtifactCopierLogGroup.Arn
+
+  ArtifactCopierFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ArtifactCopierLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvironmentId}-artifacts"
+      Description: "CloudFormation custom resource: registry layer -> S3 artifacts; empties the bucket on stack delete"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt ArtifactCopierRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Code:
+        ZipFile: |
+          import base64, json, logging, re, tarfile, time, urllib.error, urllib.request as U
+          import boto3
+          L = logging.getLogger(); L.setLevel(logging.INFO)
+          class cfnresponse:   # the cfn-response helper module is not bundled in every runtime -> minimal equivalent
+            SUCCESS, FAILED = "SUCCESS", "FAILED"
+            @staticmethod
+            def send(event, context, status, data, pid, reason=None):
+              body = json.dumps({"Status": status, "Reason": reason or f"see {context.log_stream_name}", "PhysicalResourceId": pid,
+                                 "StackId": event["StackId"], "RequestId": event["RequestId"],
+                                 "LogicalResourceId": event["LogicalResourceId"], "Data": data}).encode()
+              U.urlopen(U.Request(event["ResponseURL"], data=body, method="PUT",
+                                  headers={"Content-Type": "", "Content-Length": str(len(body))}), timeout=60)
+          s3 = boto3.client("s3")
+          ACCEPT = ("application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,"
+                    "application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json")
+          class NoRedirect(U.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k): return None
+          OPENER = U.build_opener(NoRedirect)
+          def fetch(url, headers):
+            try:
+              return OPENER.open(U.Request(url, headers=headers), timeout=120)
+            except urllib.error.HTTPError as e:
+              if e.code in (301, 302, 303, 307, 308):   # blob CDN: signed URL, no registry auth header
+                return U.urlopen(e.headers["Location"], timeout=600)
+              raise
+          def parse(ref):
+            name, tag = ref.rsplit(":", 1)
+            host, _, repo = name.partition("/")
+            if "." not in host and ":" not in host:
+              host, repo = "docker.io", name
+            if host == "docker.io":
+              host = "registry-1.docker.io"
+              repo = repo if "/" in repo else "library/" + repo
+            return host, repo, tag
+          def auth(host, repo, cred_arn):
+            try:
+              fetch(f"https://{host}/v2/", {}); return {}
+            except urllib.error.HTTPError as e:
+              if e.code != 401: raise
+              kv = dict(re.findall(r'(\w+)="([^"]*)"', e.headers.get("WWW-Authenticate", "")))
+            h = {}
+            if cred_arn:
+              c = json.loads(boto3.client("secretsmanager").get_secret_value(SecretId=cred_arn)["SecretString"])
+              h["Authorization"] = "Basic " + base64.b64encode(f"{c['username']}:{c['password']}".encode()).decode()
+            url = f"{kv['realm']}?service={kv.get('service', '')}&scope=repository:{repo}:pull"
+            d = json.load(U.urlopen(U.Request(url, headers=h), timeout=60))
+            return {"Authorization": "Bearer " + (d.get("token") or d["access_token"])}
+          def manifest(host, repo, ref, h):
+            m = json.load(fetch(f"https://{host}/v2/{repo}/manifests/{ref}", {**h, "Accept": ACCEPT}))
+            if "manifests" in m:   # index: take linux/arm64, else the first real image
+              ms = [x for x in m["manifests"] if x.get("platform", {}).get("architecture") != "unknown"]
+              ms.sort(key=lambda x: x.get("platform", {}).get("architecture") != "arm64")
+              return manifest(host, repo, ms[0]["digest"], h)
+            return m
+          def copy(p):
+            host, repo, tag = parse(p["Image"])
+            h = auth(host, repo, p.get("CredentialsSecretArn"))
+            prefix, n = p["Prefix"].rstrip("/") + "/", 0
+            for layer in manifest(host, repo, tag, h)["layers"]:
+              with fetch(f"https://{host}/v2/{repo}/blobs/{layer['digest']}", h) as blob:
+                with tarfile.open(fileobj=blob, mode="r|*") as tf:
+                  for m in tf:
+                    name = m.name.lstrip("./")
+                    if m.isfile() and "/.wh." not in "/" + name:
+                      s3.put_object(Bucket=p["Bucket"], Key=prefix + name, Body=tf.extractfile(m).read()); n += 1
+            L.info("copied %d files from %s to s3://%s/%s", n, p["Image"], p["Bucket"], prefix)
+            return n
+          def delete(bucket, prefix=""):
+            kw = {"Bucket": bucket, "Prefix": prefix}
+            for page in s3.get_paginator("list_object_versions").paginate(**kw):
+              objs = [{"Key": o["Key"], "VersionId": o["VersionId"]} for o in page.get("Versions", []) + page.get("DeleteMarkers", [])]
+              for i in range(0, len(objs), 1000):
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000], "Quiet": True})
+          def handler(event, context):
+            p, rt = event["ResourceProperties"], event["RequestType"]
+            pid = event.get("PhysicalResourceId") or p.get("Prefix", "bucket-cleaner")
+            try:
+              if p["Action"] == "wait":   # IAM propagation before the gateway validates new targets
+                if rt != "Delete": time.sleep(int(p.get("Seconds", "30")))
+                return cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "iam-wait")
+              if p["Action"] == "copy":
+                pid = f"{p['Bucket']}/{p['Prefix']}"
+                if rt == "Delete":
+                  delete(p["Bucket"], p["Prefix"].rstrip("/") + "/")
+                  return cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, pid)
+                n = copy(p)
+                pre = p["Prefix"].rstrip("/")
+                data = {"Prefix": pre, "Files": str(n), "LambdaKey": pre + "/lambda.zip", "RuntimeKey": pre + "/live_runtime.zip",
+                        "ToolSchemaUri": f"s3://{p['Bucket']}/{pre}/tools_schema.json",
+                        "SkillsUri": f"s3://{p['Bucket']}/{pre}/skills/deep-research-harness/"}
+                return cfnresponse.send(event, context, cfnresponse.SUCCESS, data, pid)
+              if rt == "Delete" and p.get("Enabled") == "true":   # Action=empty
+                delete(p["Bucket"])
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, f"{p['Bucket']}/cleaner")
+            except Exception as e:
+              L.exception("failed")
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, pid, reason=str(e)[:900])
+
+  Artifacts:
+    Type: Custom::Artifacts
+    Properties:
+      ServiceToken: !GetAtt ArtifactCopierFunction.Arn
+      ServiceTimeout: 900
+      Action: copy
+      Image: !Sub "docker.io/${ArtifactRepository}:deepresearch-artifacts-${ArtifactVersion}"
+      CredentialsSecretArn: !Ref RegistryCredentialsSecretArn
+      Bucket: !Ref Bucket
+      Prefix: !Sub "artifacts/${ArtifactVersion}"
+
+  IamPropagationWait:
+    Type: Custom::Wait
+    DependsOn: [GatewayRoleTargetsPolicy, GatewayToolsPermission]
+    Properties:
+      ServiceToken: !GetAtt ArtifactCopierFunction.Arn
+      ServiceTimeout: 300
+      Action: wait
+      Seconds: "30"
+      Trigger: !GetAtt LiveRuntime.AgentRuntimeVersion
+
+  BucketCleaner:
+    Type: Custom::BucketCleaner
+    Properties:
+      ServiceToken: !GetAtt ArtifactCopierFunction.Arn
+      ServiceTimeout: 900
+      Action: empty
+      Bucket: !Ref Bucket
+      Enabled: !If [RetainData, "false", "true"]
+
+  # ============================================================================
+  # SECTION 5: IAM ROLES (least privilege, scoped to this stack's resources)
+  # ============================================================================
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvironmentId}-GatewayRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: websearch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeWebSearch
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:aws:tool/web-search.v1"
+
+  # separate policy resources: the targets they authorize are created after the gateway
+  GatewayRoleTargetsPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref GatewayRole
+      PolicyName: targets
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt ToolsFunction.Arn
+          - Effect: Allow
+            Action: bedrock-agentcore:InvokeAgentRuntime
+            Resource:
+              - !GetAtt LiveRuntime.AgentRuntimeArn
+              - !Sub "${LiveRuntime.AgentRuntimeArn}/*"
+
+  HarnessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvironmentId}-HarnessRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: harness
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockInference
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream, bedrock:GetInferenceProfile, bedrock:ListInferenceProfiles]
+                Resource: "*"
+              - Sid: GatewayTools
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !GetAtt Gateway.GatewayArn
+              - Sid: Skills
+                Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource: [!GetAtt Bucket.Arn, !Sub "${Bucket.Arn}/artifacts/*"]
+              - Sid: Observability
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogGroups, logs:DescribeLogStreams,
+                         xray:PutTraceSegments, xray:PutTelemetryRecords, cloudwatch:PutMetricData]
+                Resource: "*"
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action: [bedrock-agentcore:GetWorkloadAccessToken, bedrock-agentcore:GetWorkloadAccessTokenForJWT,
+                         bedrock-agentcore:GetWorkloadAccessTokenForUserId]
+                Resource: "*"
+              - Sid: Memory
+                Effect: Allow
+                Action: [bedrock-agentcore:CreateEvent, bedrock-agentcore:GetEvent, bedrock-agentcore:ListEvents, bedrock-agentcore:ListSessions,
+                         bedrock-agentcore:RetrieveMemoryRecords, bedrock-agentcore:ListMemoryRecords, bedrock-agentcore:GetMemoryRecord,
+                         bedrock-agentcore:GetMemory, bedrock-agentcore:DeleteEvent]
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/*"
+              - Sid: HarnessImagePull   # VPC mode: the microVM pulls the AgentCore harness image with this role
+                Effect: Allow
+                Action: [ecr:GetAuthorizationToken, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: "*"
+              - Sid: VpcNetworking
+                Effect: Allow
+                Action: [ec2:DescribeNetworkInterfaces, ec2:DescribeSubnets, ec2:DescribeSecurityGroups, ec2:DescribeVpcs,
+                         ec2:CreateNetworkInterface, ec2:DeleteNetworkInterface, ec2:DescribeRouteTables, ec2:DescribeVpcEndpoints]
+                Resource: "*"
+
+  ToolsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: tools
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:GetQueueUrl, sqs:GetQueueAttributes]
+                Resource: !GetAtt IntakeQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:BatchWriteItem]
+                Resource: !GetAtt TasksTable.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource: [!GetAtt Bucket.Arn, !Sub "${Bucket.Arn}/*"]
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${EnvironmentId}-dedupe"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}-${EnvironmentId}/valkey*"
+              - Effect: Allow
+                Action: bedrock-agentcore:StopRuntimeSession
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:harness/*"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+              - Effect: Allow   # no logs:CreateLogGroup: the stack owns the group (no orphans after rollback/delete)
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ToolsLogGroup.Arn
+
+  DedupeLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CacheEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: dedupe
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:BatchWriteItem]
+                Resource: !GetAtt TasksTable.Arn
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:GetQueueUrl, sqs:GetQueueAttributes]
+                Resource: !GetAtt IntakeQueue.Arn
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource: "*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ValkeySecret
+              - Effect: Allow
+                Action: [ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface,
+                         ec2:DescribeSubnets, ec2:DescribeSecurityGroups, ec2:DescribeVpcs,
+                         ec2:AssignPrivateIpAddresses, ec2:UnassignPrivateIpAddresses]
+                Resource: "*"
+              - Effect: Allow   # no logs:CreateLogGroup: the stack owns the group (no orphans after rollback/delete)
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt DedupeLogGroup.Arn
+
+  LiveRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvironmentId}-LiveRuntimeRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: live
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:BatchWriteItem]
+                Resource: !GetAtt TasksTable.Arn
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:GetQueueUrl, sqs:GetQueueAttributes]
+                Resource: !GetAtt IntakeQueue.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource: [!GetAtt Bucket.Arn, !Sub "${Bucket.Arn}/*"]
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${EnvironmentId}-dedupe"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}-${EnvironmentId}/valkey*"
+              - Effect: Allow
+                Action: bedrock-agentcore:StopRuntimeSession
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:harness/*"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogGroups, logs:DescribeLogStreams,
+                         xray:PutTraceSegments, xray:PutTelemetryRecords, cloudwatch:PutMetricData]
+                Resource: "*"
+              - Effect: Allow
+                Action: [bedrock-agentcore:GetWorkloadAccessToken, bedrock-agentcore:GetWorkloadAccessTokenForJWT,
+                         bedrock-agentcore:GetWorkloadAccessTokenForUserId]
+                Resource: "*"
+
+  DispatcherTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: dispatcher
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:SendMessage,
+                         sqs:GetQueueUrl, sqs:GetQueueAttributes]
+                Resource: [!GetAtt IntakeQueue.Arn, !GetAtt IntakeDLQ.Arn]
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query,
+                         dynamodb:Scan, dynamodb:BatchWriteItem]
+                Resource: !GetAtt TasksTable.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource: [!GetAtt Bucket.Arn, !Sub "${Bucket.Arn}/*"]
+              - Effect: Allow
+                Action: [bedrock-agentcore:InvokeHarness, bedrock-agentcore:InvokeAgentRuntime, bedrock-agentcore:InvokeAgentRuntimeCommand,
+                         bedrock-agentcore:StopRuntimeSession, bedrock-agentcore:GetHarness]
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:harness/*"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref TaskEventsTopic
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref WebhookSecret
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}-${EnvironmentId}/valkey*"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${EnvironmentId}-dedupe"
+              - Effect: Allow
+                Action: [bedrock:InvokeModel]
+                Resource: "*"
+
+  DispatcherExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - !If
+          - HasRegistryCredentials
+          - PolicyName: registry-credentials
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref RegistryCredentialsSecretArn
+          - !Ref AWS::NoValue
+
+  # ============================================================================
+  # SECTION 6: LAMBDAS - semantic merge (VPC) and the Gateway "research" target
+  # ============================================================================
+  DedupeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CacheEnabled
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${EnvironmentId}-dedupe"
+      RetentionInDays: !Ref LogRetentionDays
+
+  DedupeFunction:
+    Type: AWS::Lambda::Function
+    Condition: CacheEnabled
+    DependsOn: DedupeLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvironmentId}-dedupe"
+      Description: "Semantic merge: Haiku canonicalization + embeddings + Valkey (12h)"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: dedupe_function.lambda_handler
+      Role: !GetAtt DedupeLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref Bucket
+        S3Key: !GetAtt Artifacts.LambdaKey
+      VpcConfig:
+        SecurityGroupIds: [!Ref ServiceSG]
+        SubnetIds: !If
+          - CreateVpc
+          - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          - !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          PYTHONPATH: /var/task/src
+          DR_NO_LOCAL: "1"
+          DR_PROJECT: !Sub "${ProjectName}-${EnvironmentId}"
+          DR_REGION: !Ref AWS::Region
+          DR_ACCOUNT_ID: !Ref AWS::AccountId
+          DR_STATE_TABLE: !Ref TasksTable
+          DR_STATE_QUEUE_URL: !Ref IntakeQueue
+          DR_STATE_BUCKET: !Ref Bucket
+          DR_DEDUPE_MODE: direct
+          DR_DEDUPE_VALKEY_SECRET_ID: !Ref ValkeySecret
+          DR_DEDUPE_CANON_MODEL: !Ref CanonicalizerModelId
+          DR_DEDUPE_EMBED_MODEL: !Ref EmbeddingModelId
+          DR_LOG_LEVEL: INFO
+
+  ToolsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${EnvironmentId}-mcp-tools"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ToolsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ToolsLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvironmentId}-mcp-tools"
+      Description: "Gateway target 'research': submit / run / status / report / cancel"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: tools_function.lambda_handler
+      Role: !GetAtt ToolsLambdaRole.Arn
+      Timeout: 840
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref Bucket
+        S3Key: !GetAtt Artifacts.LambdaKey
+      Environment:
+        Variables:
+          PYTHONPATH: /var/task/src
+          DR_NO_LOCAL: "1"
+          DR_PROJECT: !Sub "${ProjectName}-${EnvironmentId}"
+          DR_REGION: !Ref AWS::Region
+          DR_ACCOUNT_ID: !Ref AWS::AccountId
+          DR_STATE_TABLE: !Ref TasksTable
+          DR_STATE_QUEUE_URL: !Ref IntakeQueue
+          QUEUE_URL: !Ref IntakeQueue
+          DR_STATE_BUCKET: !Ref Bucket
+          DR_DEDUPE_ENABLED: !Ref EnableSemanticCache
+          DR_DEDUPE_MODE: lambda
+          DR_DEDUPE_LAMBDA_NAME: !Sub "${ProjectName}-${EnvironmentId}-dedupe"
+          DR_DEDUPE_VALKEY_SECRET_ID: !Sub "${ProjectName}-${EnvironmentId}/valkey"
+          DR_LOG_LEVEL: INFO
+
+  GatewayToolsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ToolsFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # ============================================================================
+  # SECTION 7: AGENTCORE - Gateway, targets, rate limit, live MCP Runtime, harness
+  # ============================================================================
+  Gateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentId}-gw"
+      Description: "Deep research MCP gateway: Web Search connector, research pipeline, live streaming server"
+      RoleArn: !GetAtt GatewayRole.Arn
+      AuthorizerType: AWS_IAM
+      ProtocolType: MCP
+      ProtocolConfiguration:
+        Mcp:
+          # the harness MCP client negotiates 2025-11-25; new clients use the stateless 2026-07-28
+          SupportedVersions: ["2025-11-25", "2026-07-28"]
+          SearchType: SEMANTIC
+          StreamingConfiguration:
+            EnableResponseStreaming: true
+          Instructions: "Deep research tools. live___research (async, default) returns a task_id; live___watch_research streams reasoning; live___research_live streams one blocking run; web-search___WebSearch searches the web."
+      Tags:
+        Project: !Sub "${ProjectName}-${EnvironmentId}"
+
+  WebSearchTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt Gateway.GatewayIdentifier
+      Name: web-search
+      Description: "Amazon-managed Web Search (agentic retrieval)"
+      TargetConfiguration:
+        Mcp:
+          Connector:
+            Source:
+              ConnectorId: web-search
+            Configurations:
+              - Name: WebSearch
+                ParameterValues:
+                  domainFilter:
+                    exclude: ["pinterest.com", "quora.com"]
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  ResearchTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn: IamPropagationWait
+    Properties:
+      GatewayIdentifier: !GetAtt Gateway.GatewayIdentifier
+      Name: research
+      Description: "deep-research pipeline: submit / run / status / report / cancel"
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt ToolsFunction.Arn
+            ToolSchema:
+              S3:
+                Uri: !GetAtt Artifacts.ToolSchemaUri
+                BucketOwnerAccountId: !Ref AWS::AccountId
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  LiveTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn: IamPropagationWait
+    Properties:
+      GatewayIdentifier: !GetAtt Gateway.GatewayIdentifier
+      Name: live
+      Description: "deep-research live: research (async) / research_live (streaming) / watch / status / cancel"
+      TargetConfiguration:
+        Mcp:
+          McpServer:
+            Endpoint: !Sub "https://bedrock-agentcore.${AWS::Region}.amazonaws.com/runtimes/arn%3Aaws%3Abedrock-agentcore%3A${AWS::Region}%3A${AWS::AccountId}%3Aruntime%2F${LiveRuntime.AgentRuntimeId}/invocations?qualifier=DEFAULT"
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+          CredentialProvider:
+            IamCredentialProvider:
+              Service: bedrock-agentcore
+              Region: !Ref AWS::Region
+
+  GatewayRateLimit:
+    Type: AWS::BedrockAgentCore::GatewayRateLimit
+    Condition: HasRateLimit
+    Properties:
+      GatewayIdentifier: !GetAtt Gateway.GatewayIdentifier
+      Description: "requests per minute per IAM principal"
+      DimensionKeys: ["$.context.iam.principal"]
+      Entries:
+        - Dimensions:
+            "$.context.iam.principal": "*"
+          Requests:
+            - Rate: !Ref GatewayRateLimitPerCallerRpm
+              Period: minute
+
+  LiveRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: !Sub "${ProjectName}_${EnvironmentId}_live"
+      Description: "deep-research streaming MCP server (research / research_live / watch / cancel)"
+      RoleArn: !GetAtt LiveRuntimeRole.Arn
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Code:
+            S3:
+              Bucket: !Ref Bucket
+              Prefix: !GetAtt Artifacts.RuntimeKey
+          Runtime: PYTHON_3_12
+          EntryPoint: [live_main.py]
+      ProtocolConfiguration: MCP
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      LifecycleConfiguration:
+        IdleRuntimeSessionTimeout: 1800
+        MaxLifetime: 28800
+      EnvironmentVariables:
+        DR_NO_LOCAL: "1"
+        DR_PROJECT: !Sub "${ProjectName}-${EnvironmentId}"
+        DR_REGION: !Ref AWS::Region
+        DR_ACCOUNT_ID: !Ref AWS::AccountId
+        DR_STATE_TABLE: !Ref TasksTable
+        DR_STATE_QUEUE_URL: !Ref IntakeQueue
+        DR_STATE_BUCKET: !Ref Bucket
+        DR_DEDUPE_ENABLED: !Ref EnableSemanticCache
+        DR_DEDUPE_MODE: lambda
+        DR_DEDUPE_LAMBDA_NAME: !Sub "${ProjectName}-${EnvironmentId}-dedupe"
+        DR_DEDUPE_VALKEY_SECRET_ID: !Sub "${ProjectName}-${EnvironmentId}/valkey"
+        DR_LOG_LEVEL: INFO
+        DR_ARTIFACT_VERSION: !Ref ArtifactVersion
+      Tags:
+        Project: !Sub "${ProjectName}-${EnvironmentId}"
+
+  Harness:
+    Type: AWS::BedrockAgentCore::Harness
+    Properties:
+      HarnessName: !Sub "${ProjectName}_${EnvironmentId}_harness"
+      ExecutionRoleArn: !GetAtt HarnessRole.Arn
+      Model:
+        BedrockModelConfig:
+          ModelId: !Ref ResearchModelId
+          MaxTokens: 16384
+          ApiFormat: converse_stream
+          # extended thinking is applied by HarnessThinking (CloudFormation would stringify budget_tokens here)
+      SystemPrompt:
+        - Text: |-
+            You are Deep Research, a rigorous research analyst running inside Amazon Bedrock AgentCore.
+            Always load and follow the `deep-research-harness` skill for any research request.
+            Ground every factual statement in results returned by the WebSearch tool and cite them inline as [N].
+            Issue several independent WebSearch calls in the same turn whenever the sub-questions are independent
+            (they execute in parallel). Never invent URLs. Write all artifacts under /tmp/research/ and finish with the
+            JSON status line described in the skill.
+      Tools:
+        - Type: agentcore_gateway
+          Name: research_tools
+          Config:
+            AgentCoreGateway:
+              GatewayArn: !GetAtt Gateway.GatewayArn
+              OutboundAuth:
+                AwsIam: {}
+      Skills:
+        - S3:
+            Uri: !GetAtt Artifacts.SkillsUri
+      MaxIterations: 150
+      TimeoutSeconds: 3600
+      Truncation:
+        Strategy: summarization
+        Config:
+          Summarization:
+            SummaryRatio: 0.3
+            PreserveRecentMessages: 10
+      Memory: !If
+        - HarnessMemoryManaged
+        - ManagedMemoryConfiguration:
+            Strategies: [SEMANTIC, SUMMARIZATION]
+            EventExpiryDuration: 30
+        - Disabled: {}
+      Environment:
+        AgentCoreRuntimeEnvironment:
+          LifecycleConfiguration:
+            IdleRuntimeSessionTimeout: 1800
+            MaxLifetime: 28800
+          NetworkConfiguration: !If
+            - HarnessInVpc
+            - NetworkMode: VPC
+              NetworkModeConfig:
+                SecurityGroups: [!Ref ServiceSG]
+                Subnets: !If
+                  - CreateVpc
+                  - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+                  - !Ref PrivateSubnetIds
+            - NetworkMode: PUBLIC
+      Tags:
+        - Key: Project
+          Value: !Sub "${ProjectName}-${EnvironmentId}"
+        - Key: ArtifactVersion
+          Value: !Ref ArtifactVersion
+
+  CfnHelperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${EnvironmentId}-cfn-helper"
+      RetentionInDays: !Ref LogRetentionDays
+
+  CfnHelperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: harness-tuning
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # UpdateHarness re-applies the whole harness (runtime, workload identity, memory) with the caller's
+              # permissions; deploy-time only helper -> AgentCore control plane on this account/region
+              - Effect: Allow
+                Action: bedrock-agentcore:*
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action: [ec2:DescribeSubnets, ec2:DescribeSecurityGroups, ec2:DescribeVpcs, ec2:DescribeNetworkInterfaces]
+                Resource: "*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource: [!GetAtt Bucket.Arn, !Sub "${Bucket.Arn}/artifacts/*"]
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt HarnessRole.Arn
+              - Effect: Allow   # no logs:CreateLogGroup: the stack owns the group (no orphans after rollback/delete)
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt CfnHelperLogGroup.Arn
+
+  CfnHelperFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CfnHelperLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvironmentId}-cfn-helper"
+      Description: "CloudFormation custom resource: harness settings that CloudFormation cannot express (integer thinking budget)"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: cfn_function.lambda_handler
+      Role: !GetAtt CfnHelperRole.Arn
+      Timeout: 600
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref Bucket
+        S3Key: !GetAtt Artifacts.LambdaKey
+      Environment:
+        Variables:
+          PYTHONPATH: /var/task/src
+
+  # re-applied whenever anything that makes CloudFormation update the harness changes
+  HarnessThinking:
+    Type: Custom::HarnessThinking
+    Properties:
+      ServiceToken: !GetAtt CfnHelperFunction.Arn
+      ServiceTimeout: 600
+      Action: harness_thinking
+      HarnessId: !GetAtt Harness.HarnessId
+      BudgetTokens: !Ref ThinkingBudgetTokens
+      Trigger: !Join ["|", [!Ref ResearchModelId, !Ref ArtifactVersion, !Ref HarnessNetworkMode, !Ref HarnessMemory,
+                            !GetAtt Gateway.GatewayArn, !GetAtt HarnessRole.Arn]]
+
+  # ============================================================================
+  # SECTION 8: DISPATCHER - ECS Fargate (arm64), private subnets, no public IP
+  # Pulls SQS only while admission slots are free, drives harness sessions, writes events/progress
+  # to DynamoDB, stores reports in S3, fires webhooks/SNS. Scale with DispatcherDesiredCount.
+  # ============================================================================
+  DispatcherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-${EnvironmentId}/dispatcher"
+      RetentionInDays: !Ref LogRetentionDays
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${EnvironmentId}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Project
+          Value: !Sub "${ProjectName}-${EnvironmentId}"
+
+  DispatcherTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${EnvironmentId}-dispatcher"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt DispatcherExecutionRole.Arn
+      TaskRoleArn: !GetAtt DispatcherTaskRole.Arn
+      ContainerDefinitions:
+        - Name: dispatcher
+          Image: !Sub "docker.io/${ArtifactRepository}:deepresearch-app-${ArtifactVersion}"
+          Essential: true
+          StopTimeout: 120
+          RepositoryCredentials: !If
+            - HasRegistryCredentials
+            - CredentialsParameter: !Ref RegistryCredentialsSecretArn
+            - !Ref AWS::NoValue
+          Command: ["python", "scripts/run_dispatcher.py"]
+          Environment:
+            - {Name: DR_NO_LOCAL, Value: "1"}
+            - {Name: DR_PROJECT, Value: !Sub "${ProjectName}-${EnvironmentId}"}
+            - {Name: DR_REGION, Value: !Ref AWS::Region}
+            - {Name: AWS_REGION, Value: !Ref AWS::Region}
+            - {Name: DR_ACCOUNT_ID, Value: !Ref AWS::AccountId}
+            - {Name: DR_STATE_TABLE, Value: !Ref TasksTable}
+            - {Name: DR_STATE_QUEUE_URL, Value: !Ref IntakeQueue}
+            - {Name: DR_STATE_DLQ_URL, Value: !Ref IntakeDLQ}
+            - {Name: DR_STATE_BUCKET, Value: !Ref Bucket}
+            - {Name: DR_STATE_HARNESS_ARN, Value: !GetAtt Harness.Arn}
+            - {Name: DR_STATE_SNS_TOPIC_ARN, Value: !Ref TaskEventsTopic}
+            - {Name: DR_STATE_WEBHOOK_SECRET_ID, Value: !Ref WebhookSecret}
+            - {Name: DR_STATE_GATEWAY_URL, Value: !GetAtt Gateway.GatewayUrl}
+            - {Name: DR_DEDUPE_ENABLED, Value: !Ref EnableSemanticCache}
+            - {Name: DR_DEDUPE_MODE, Value: auto}
+            - {Name: DR_DEDUPE_LAMBDA_NAME, Value: !Sub "${ProjectName}-${EnvironmentId}-dedupe"}
+            - {Name: DR_DEDUPE_VALKEY_SECRET_ID, Value: !Sub "${ProjectName}-${EnvironmentId}/valkey"}
+            - {Name: DR_DISPATCHER_MAX_INFLIGHT, Value: !Ref MaxInflight}
+            - {Name: DR_DISPATCHER_SESSION_CREATE_PER_SEC, Value: !Ref SessionCreatePerSec}
+            - {Name: DR_DISPATCHER_WORKERS, Value: !Ref DispatcherWorkers}
+            - {Name: DR_LOG_LEVEL, Value: INFO}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DispatcherLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: dispatcher
+      Tags:
+        - Key: Project
+          Value: !Sub "${ProjectName}-${EnvironmentId}"
+
+  DispatcherService:
+    Type: AWS::ECS::Service
+    # BucketCleaner: on stack delete the dispatcher stops before the bucket is emptied
+    DependsOn: [ResearchTarget, LiveTarget, WebSearchTarget, BucketCleaner, HarnessThinking]
+    Properties:
+      ServiceName: dispatcher
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref DispatcherTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DispatcherDesiredCount
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: [!Ref ServiceSG]
+          Subnets: !If
+            - CreateVpc
+            - [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+            - !Ref PrivateSubnetIds
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Project
+          Value: !Sub "${ProjectName}-${EnvironmentId}"
+
+  # ============================================================================
+  # SECTION 9: MCP CLIENT ACCESS - least-privilege policy (+ optional IAM user with a static key)
+  # ============================================================================
+  McpClientPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-${EnvironmentId}-McpClient"
+      Description: "Call the deep research MCP gateway (attach to users/roles of MCP clients)"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: bedrock-agentcore:InvokeGateway
+            Resource: !GetAtt Gateway.GatewayArn
+
+  McpClientUser:
+    Type: AWS::IAM::User
+    Condition: CreateClientUser
+    Properties:
+      UserName: !Sub "${ProjectName}-${EnvironmentId}-mcp-client"
+      ManagedPolicyArns: [!Ref McpClientPolicy]
+
+  McpClientAccessKey:
+    Type: AWS::IAM::AccessKey
+    Condition: CreateClientUser
+    Properties:
+      UserName: !Ref McpClientUser
+
+  McpClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateClientUser
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentId}/mcp-iam-key"
+      Description: "Static IAM key allowed only to InvokeGateway (for mcp-proxy-for-aws / scripts/setup_claude_mcp.sh)"
+      SecretString: !Sub
+        - '{"aws_access_key_id":"${McpClientAccessKey}","aws_secret_access_key":"${Secret}","region":"${AWS::Region}","gateway_url":"${Url}"}'
+        - Secret: !GetAtt McpClientAccessKey.SecretAccessKey
+          Url: !GetAtt Gateway.GatewayUrl
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  StackName:
+    Value: !Ref AWS::StackName
+  Region:
+    Value: !Ref AWS::Region
+  Project:
+    Description: "Value for DR_PROJECT"
+    Value: !Sub "${ProjectName}-${EnvironmentId}"
+  GatewayUrl:
+    Description: "MCP endpoint (SigV4, service bedrock-agentcore)"
+    Value: !GetAtt Gateway.GatewayUrl
+  GatewayId:
+    Value: !GetAtt Gateway.GatewayIdentifier
+  GatewayArn:
+    Value: !GetAtt Gateway.GatewayArn
+  HarnessArn:
+    Value: !GetAtt Harness.Arn
+  LiveRuntimeArn:
+    Value: !GetAtt LiveRuntime.AgentRuntimeArn
+  BucketName:
+    Value: !Ref Bucket
+  ArtifactPrefix:
+    Value: !Sub "s3://${Bucket}/${Artifacts.Prefix}/"
+  QueueUrl:
+    Value: !Ref IntakeQueue
+  DlqUrl:
+    Value: !Ref IntakeDLQ
+  TableName:
+    Value: !Ref TasksTable
+  SnsTopicArn:
+    Value: !Ref TaskEventsTopic
+  WebhookSecretArn:
+    Value: !Ref WebhookSecret
+  ValkeySecretArn:
+    Condition: CacheEnabled
+    Value: !Ref ValkeySecret
+  DedupeFunctionName:
+    Condition: CacheEnabled
+    Value: !Ref DedupeFunction
+  ToolsFunctionName:
+    Value: !Ref ToolsFunction
+  McpClientPolicyArn:
+    Value: !Ref McpClientPolicy
+  McpClientSecretArn:
+    Condition: CreateClientUser
+    Value: !Ref McpClientSecret
+  DispatcherCluster:
+    Value: !Ref Cluster
+  DispatcherLogGroup:
+    Value: !Ref DispatcherLogGroup
+  VpcId:
+    Value: !If [CreateVpc, !Ref VPC, !Ref VpcId]
+  ServiceSecurityGroup:
+    Value: !Ref ServiceSG
+  LocalSetup:
+    Description: "Point the repo's scripts (live_research.py, setup_claude_mcp.sh, e2e) at this stack"
+    Value: !Sub "python scripts/use_stack.py ${AWS::StackName} --region ${AWS::Region}"

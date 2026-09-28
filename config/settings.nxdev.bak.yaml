@@ -1,0 +1,76 @@
+# nxdev Deep Research on Amazon Bedrock AgentCore harness
+# All values can be overridden with environment variables DR_<SECTION>_<KEY> (upper-case), e.g. DR_HARNESS_REGION=us-east-1
+project: nxdev-deepresearch
+account_id: "131166810173"
+
+stack:                       # existing CloudFormation stack whose resources we reuse
+  name: nx
+  region: us-west-2
+
+gateway:                     # Web Search connector is only offered in us-east-1 / eu-west-1 / ap-northeast-1
+  region: us-east-1
+  name: nxdev-deepresearch-gw
+  reuse_gateway_id: ""       # set e.g. "agentx-websearch-dxkgngp2q6" to reuse an existing gateway instead of creating one
+  role_name: nxdev-deepresearch-GatewayRole
+  web_search_target_name: web-search
+  web_search_connector_version: "1.2.0"
+  domain_exclude: ["pinterest.com", "quora.com"]
+  rate_limit_per_caller_rpm: 600     # customer-defined limit per IAM principal (0 disables)
+  supported_versions: ["2025-11-25", "2026-07-28"]   # single gateway: harness negotiates 2025-11-25, new clients use 2026-07-28
+  mcp_client_iam_user: nxdev-deepresearch-mcp-client   # least-privilege IAM user (InvokeGateway only) for MCP clients
+
+harness:
+  region: us-west-2          # stack region (VPC / Memory / DynamoDB live here). Use us-east-1 if cross-region gateway attach is rejected.
+  name: nxdev_deepresearch_harness
+  role_name: nxdev-deepresearch-HarnessExecRole
+  model_id: global.anthropic.claude-sonnet-4-6
+  max_tokens: 16384
+  thinking_budget_tokens: 3000   # extended thinking -> reasoningContent visible in the live stream (0 disables)
+  max_iterations: 150
+  timeout_seconds: 3600
+  idle_timeout_seconds: 1800
+  max_lifetime_seconds: 28800
+  network_mode: VPC          # VPC -> stack private subnets + DataServicesSG; PUBLIC -> no VPC (still no inbound public IP)
+  memory_mode: byo           # byo (stack BedrockMemory) | managed | disabled
+  truncation: summarization  # sliding_window | summarization | none
+  workspace_dir: /tmp/research
+
+storage:
+  bucket: nxdev-deepresearch-{account_id}-{harness_region}
+  skills_prefix: skills/deep-research-harness/
+  reports_prefix: reports/
+
+queue:
+  region: us-west-2
+  name: nxdev-deepresearch-intake
+  dlq_name: nxdev-deepresearch-intake-dlq
+  visibility_timeout_seconds: 300
+  max_receive_count: 50     # admission denials no longer consume receives; 50 guards true poison messages
+
+table:                       # reuse stack DynamoDB table (pk/sk, TTL attribute "ttl")
+  name: nxdev-sessions
+  region: us-west-2
+  ttl_days: 30
+
+dispatcher:                  # admission control — see docs/QUOTAS.md for how these map to service quotas
+  max_inflight: 100          # C: executing tasks (default quotas: ~100-300; raise after quota increases)
+  session_create_per_sec: 20 # keep below "Rate of new Runtime session creation" (default 25)
+  websearch_tps_budget: 8    # keep below "Rate of Web Search Tool queries" (default 10 in us-east-1)
+  searches_per_task_estimate: 30
+  task_minutes_estimate: 20
+  workers: 8
+  progress_flush_seconds: 2
+
+dedupe:                      # semantic merge of equivalent async research requests -> one task_id (Valkey-backed)
+  enabled: true
+  mode: auto                 # auto | direct | lambda   (auto: direct Valkey when reachable, else the VPC Lambda)
+  lambda_name: nxdev-deepresearch-dedupe
+  valkey_secret_id: nxdev/deepresearch/valkey
+  ttl_seconds: 43200         # cache lifetime of a merged task (12 h); override with DR_DEDUPE_TTL_SECONDS
+  window_seconds: 5          # merge window / lock timeout for concurrent identical requests
+  similarity_high: 0.90      # >= merge without judge
+  similarity_low: 0.68       # <  distinct without judge; between -> LLM judge
+  embed_dims: 1024
+  max_candidates: 200        # candidates scanned per lookup (most recent first, same time scope)
+  canon_model: global.anthropic.claude-haiku-4-5-20251001-v1:0
+  embed_model: us.cohere.embed-v4:0

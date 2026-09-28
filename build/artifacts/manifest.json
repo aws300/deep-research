@@ -1,0 +1,13 @@
+{
+ "version": "1.0.2",
+ "files": {
+  "lambda.zip": "d42879927b96fa9441f5f24416020ab81470ae2c24b823f29c5855d96201a428",
+  "live_runtime.zip": "bfde18e369399d3c563d23dfcc27647d136829e0231ee22822ae23c9dd606b12",
+  "skills/deep-research-harness/SKILL.md": "44928e3f27ed9fbd1ec0834866460ee07a62fb4bbddca53761763b62f02c3d78",
+  "skills/deep-research-harness/references/report_template.md": "8b0c403ef6ba6917da636d9a7fe1f90e393f19ed536578f7741b3ca277b4ac8f",
+  "skills/deep-research-harness/scripts/citation_manager.py": "02334e5286b2a541fb2a6409959ea43ac7bc8b749d3cbeb427ff7fafb78d1a02",
+  "skills/deep-research-harness/scripts/evidence_store.py": "6deba75f5902be0d272f2992f54988b8a316fc4bc44cd3b094b812bb4409d140",
+  "skills/deep-research-harness/scripts/validate_report.py": "851c1de275c039b8e5858785010181500960b05a9be463cdd6cecd5bbf101aa3",
+  "tools_schema.json": "b2a4fde25a04cb6c36f7e969976dbec242c9e2c96e15cf66b7ba85cca2ee9039"
+ }
+}

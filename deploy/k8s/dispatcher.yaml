@@ -1,0 +1,36 @@
+# Optional: run the dispatcher on an EKS cluster instead of the CloudFormation ECS service (no service / ingress; outbound only).
+# Image:  docker.io/aws300/deploy:deepresearch-app-<version>  (or build the repo-root Dockerfile)
+# The pod uses EKS Pod Identity; attach a policy to the chosen role granting: sqs:*Message* on the intake queue,
+# dynamodb:GetItem/PutItem/UpdateItem/Query/BatchWriteItem on the tasks table, s3:PutObject/GetObject on the bucket,
+# bedrock-agentcore:InvokeHarness / InvokeAgentRuntime / InvokeAgentRuntimeCommand on the harness ARN.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepresearch-dispatcher
+  namespace: default
+  labels: {app: deepresearch-dispatcher}
+spec:
+  replicas: 1          # one replica per shard; the DynamoDB counter is shared, so >1 replica is safe
+  selector: {matchLabels: {app: deepresearch-dispatcher}}
+  template:
+    metadata: {labels: {app: deepresearch-dispatcher}}
+    spec:
+      serviceAccountName: deepresearch-dispatcher
+      containers:
+        - name: dispatcher
+          image: REPLACE_WITH_IMAGE
+          command: ["python", "scripts/run_dispatcher.py"]
+          env:
+            - {name: DR_DISPATCHER_MAX_INFLIGHT, value: "100"}
+            - {name: DR_DISPATCHER_WORKERS, value: "16"}
+            # region + resource ids: copy the CloudFormation stack output "DispatcherEnv" (or use config/local.yaml)
+            - {name: AWS_REGION, value: REPLACE_WITH_REGION}
+          resources:
+            requests: {cpu: "250m", memory: "512Mi"}
+            limits: {cpu: "1", memory: "1Gi"}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deepresearch-dispatcher
+  namespace: default

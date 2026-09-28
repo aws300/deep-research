@@ -1,0 +1,90 @@
+# Deep Research on Amazon Bedrock AgentCore harness — generic defaults (no account, no region, no environment names).
+# Resolution order: settings.yaml < config/local.yaml (optional overlay) < env DR_<SECTION>_<KEY> / DR_PROJECT / DR_REGION.
+# Empty `region` fields inherit the top-level region, which defaults to DR_REGION / AWS_REGION / the boto3 session region.
+# String values may use {project}, {region}, {account_id} (account id is resolved lazily via STS).
+project: deepresearch
+region: ""
+account_id: ""
+
+stack:                       # optional: an existing CloudFormation stack to reuse (VPC/Memory/table) for scripts/deploy.py
+  name: ""
+  region: ""
+
+gateway:                     # must be a region that offers the Web Search connector (see docs/DEPLOYMENT.md)
+  region: ""
+  name: "{project}-gw"
+  reuse_gateway_id: ""       # set e.g. "agentx-websearch-dxkgngp2q6" to reuse an existing gateway instead of creating one
+  role_name: "{project}-GatewayRole"
+  web_search_target_name: web-search
+  web_search_connector_version: "1.2.0"
+  domain_exclude: ["pinterest.com", "quora.com"]
+  rate_limit_per_caller_rpm: 600     # customer-defined limit per IAM principal (0 disables)
+  supported_versions: ["2025-11-25", "2026-07-28"]   # single gateway: harness negotiates 2025-11-25, new clients use 2026-07-28
+  mcp_client_iam_user: "{project}-mcp-client"   # least-privilege IAM user (InvokeGateway only) for MCP clients
+
+harness:
+  region: ""
+  name: deepresearch_harness      # [a-zA-Z][a-zA-Z0-9_]{0,39}
+  role_name: "{project}-HarnessExecRole"
+  model_id: global.anthropic.claude-sonnet-4-6
+  max_tokens: 16384
+  thinking_budget_tokens: 3000   # extended thinking -> reasoningContent visible in the live stream (0 disables)
+  max_iterations: 150
+  timeout_seconds: 3600
+  idle_timeout_seconds: 1800
+  max_lifetime_seconds: 28800
+  network_mode: PUBLIC       # PUBLIC | VPC (VPC needs subnets with NAT egress)
+  memory_mode: managed       # byo (existing AgentCore Memory) | managed | disabled
+  truncation: summarization  # sliding_window | summarization | none
+  workspace_dir: /tmp/research
+
+storage:
+  bucket: "{project}-{account_id}-{region}"
+  skills_prefix: skills/deep-research-harness/
+  reports_prefix: reports/
+
+queue:
+  region: ""
+  name: "{project}-intake"
+  dlq_name: "{project}-intake-dlq"
+  visibility_timeout_seconds: 300
+  max_receive_count: 50     # admission denials no longer consume receives; 50 guards true poison messages
+
+table:                       # DynamoDB table (pk/sk, TTL attribute "ttl")
+  name: "{project}-tasks"
+  region: ""
+  ttl_days: 30
+
+dispatcher:                  # admission control — see docs/QUOTAS.md for how these map to service quotas
+  max_inflight: 100          # C: executing tasks (default quotas: ~100-300; raise after quota increases)
+  session_create_per_sec: 20 # keep below "Rate of new Runtime session creation" (default 25)
+  websearch_tps_budget: 8    # keep below "Rate of Web Search Tool queries" (default 10 TPS)
+  searches_per_task_estimate: 30
+  task_minutes_estimate: 20
+  workers: 8
+  progress_flush_seconds: 2
+
+dedupe:                      # semantic merge of equivalent async research requests -> one task_id (Valkey-backed)
+  enabled: true
+  mode: auto                 # auto | direct | lambda   (auto: direct Valkey when reachable, else the VPC Lambda)
+  lambda_name: "{project}-dedupe"
+  valkey_secret_id: "{project}/valkey"
+  ttl_seconds: 43200         # cache lifetime of a merged task (12 h); override with DR_DEDUPE_TTL_SECONDS
+  window_seconds: 5          # merge window / lock timeout for concurrent identical requests
+  similarity_high: 0.90      # >= merge without judge
+  similarity_low: 0.68       # <  distinct without judge; between -> LLM judge
+  embed_dims: 1024
+  max_candidates: 200        # candidates scanned per lookup (most recent first, same time scope)
+  canon_model: global.anthropic.claude-haiku-4-5-20251001-v1:0
+  embed_model: global.cohere.embed-v4:0
+
+live:                        # streaming MCP server hosted on AgentCore Runtime
+  runtime_name: deepresearch_live_mcp   # [a-zA-Z][a-zA-Z0-9_]{0,47}
+
+notifications:
+  sns_topic_name: "{project}-task-events"
+  webhook_secret_id: "{project}/webhook-secret"
+
+mcp_client:                  # local MCP clients (Claude Code proxy, CLI scripts)
+  aws_profile: deepresearch-mcp
+  secret_id: "{project}/mcp-iam-key"

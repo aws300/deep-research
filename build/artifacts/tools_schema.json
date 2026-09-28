@@ -1,0 +1,114 @@
+[
+ {
+  "name": "submit_research",
+  "description": "Start an asynchronous deep-research task and return a task_id. Semantically equivalent requests within 12h are merged into the same task_id (merged=true). quick ~3-6 min / standard ~10-20 min / deep ~20-40 min. Poll get_research_status, then get_research_report.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "query": {
+     "type": "string",
+     "description": "Research question or brief (any language)."
+    },
+    "depth": {
+     "type": "string",
+     "description": "Research depth: quick | standard | deep. Default standard."
+    },
+    "callback_url": {
+     "type": "string",
+     "description": "Optional https:// webhook. On completion the service POSTs a signed JSON (task_id, status, report_s3, download_url) so nobody has to poll."
+    },
+    "cache": {
+     "type": "boolean",
+     "description": "Default true: merge with an equivalent task submitted in the last 12h. false: always start a fresh, independent task."
+    }
+   },
+   "required": [
+    "query"
+   ]
+  }
+ },
+ {
+  "name": "run_research",
+  "description": "Run a research and wait up to 300 s (sync cap) in this call; returns the Markdown report if finished, otherwise status=running + task_id. For a single blocking call that always completes, prefer live___research_live (streams keep-alives).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "query": {
+     "type": "string",
+     "description": "Research question or brief (any language)."
+    },
+    "depth": {
+     "type": "string",
+     "description": "quick (recommended for synchronous use). Default quick."
+    },
+    "wait_seconds": {
+     "type": "integer",
+     "description": "Max seconds to wait (30-300). Default 300."
+    },
+    "cache": {
+     "type": "boolean",
+     "description": "Default true: reuse an equivalent recent task; false: fresh task."
+    }
+   },
+   "required": [
+    "query"
+   ]
+  }
+ },
+ {
+  "name": "cancel_research",
+  "description": "Detach from / cancel a research task. With subscription_id only your callback/stream is detached; the shared backend research is stopped only when no other subscriber remains (or force=true).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "task_id": {
+     "type": "string"
+    },
+    "subscription_id": {
+     "type": "string"
+    },
+    "force": {
+     "type": "boolean",
+     "description": "stop the backend even if shared"
+    }
+   },
+   "required": [
+    "task_id"
+   ]
+  }
+ },
+ {
+  "name": "get_research_status",
+  "description": "Status, progress counters and the most recent reasoning / tool steps of a research task.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "task_id": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "task_id"
+   ]
+  }
+ },
+ {
+  "name": "get_research_report",
+  "description": "Fetch the finished Markdown report. mode=content returns the Markdown text (save it as a .md file); mode=url returns a 1-hour presigned S3 download URL plus the s3:// path.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "task_id": {
+     "type": "string"
+    },
+    "mode": {
+     "type": "string",
+     "description": "content | url. Default content."
+    }
+   },
+   "required": [
+    "task_id"
+   ]
+  }
+ }
+]

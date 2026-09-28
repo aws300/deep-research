@@ -1,0 +1,47 @@
+# Local overlay for the existing "nxdev" deployment (us-west-2 + us-east-1, reusing the `nx` CloudFormation stack).
+# Deep-merged over settings.yaml when present. Not shipped in images / CloudFormation artifacts.
+# Delete or rename this file (or set DR_NO_LOCAL=1) to use the generic, region/account-agnostic defaults.
+project: nxdev-deepresearch
+region: us-west-2
+
+stack:
+  name: nx
+  region: us-west-2
+
+gateway:
+  region: us-east-1
+  name: nxdev-deepresearch-gw
+  role_name: nxdev-deepresearch-GatewayRole
+  mcp_client_iam_user: nxdev-deepresearch-mcp-client
+
+harness:
+  name: nxdev_deepresearch_harness
+  role_name: nxdev-deepresearch-HarnessExecRole
+  network_mode: VPC
+  memory_mode: byo
+
+storage:
+  bucket: nxdev-deepresearch-{account_id}-{region}
+
+queue:
+  name: nxdev-deepresearch-intake
+  dlq_name: nxdev-deepresearch-intake-dlq
+
+table:
+  name: nxdev-sessions
+
+dedupe:
+  embed_model: us.cohere.embed-v4:0
+  lambda_name: nxdev-deepresearch-dedupe
+  valkey_secret_id: nxdev/deepresearch/valkey
+
+mcp_client:
+  aws_profile: nxdev-mcp
+  secret_id: nxdev/deepresearch/mcp-iam-key
+
+live:
+  runtime_name: nxdev_deepresearch_live_mcp
+
+notifications:
+  sns_topic_name: nxdev-deepresearch-task-events
+  webhook_secret_id: nxdev/deepresearch/webhook-secret

@@ -1,0 +1,20 @@
+{
+  "stack_name": "deepresearch-e2e3",
+  "gateway_url": "https://deepresearch-e2e3-gw-waybvg6j1e.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp",
+  "gateway_id": "deepresearch-e2e3-gw-waybvg6j1e",
+  "gateway_arn": "arn:aws:bedrock-agentcore:us-east-1:131166810173:gateway/deepresearch-e2e3-gw-waybvg6j1e",
+  "harness_arn": "arn:aws:bedrock-agentcore:us-east-1:131166810173:harness/deepresearch_e2e3_harness-JR39pIGxbV",
+  "harness_id": "deepresearch_e2e3_harness-JR39pIGxbV",
+  "harness_runtime_id": "harness_deepresearch_e2e3_harness-0k3XKGA4p8",
+  "live_runtime_arn": "arn:aws:bedrock-agentcore:us-east-1:131166810173:runtime/deepresearch_e2e3_live-YfdtizBr4f",
+  "live_runtime_id": "deepresearch_e2e3_live-YfdtizBr4f",
+  "queue_url": "https://sqs.us-east-1.amazonaws.com/131166810173/deepresearch-e2e3-intake",
+  "dlq_url": "https://sqs.us-east-1.amazonaws.com/131166810173/deepresearch-e2e3-intake-dlq",
+  "bucket": "deepresearch-e2e3-131166810173-us-east-1",
+  "table": "deepresearch-e2e3-tasks",
+  "sns_topic_arn": "arn:aws:sns:us-east-1:131166810173:deepresearch-e2e3-task-events",
+  "webhook_secret_id": "arn:aws:secretsmanager:us-east-1:131166810173:secret:deepresearch-e2e3/webhook-secret-w23lXv",
+  "skills_uri": "s3://deepresearch-e2e3-131166810173-us-east-1/artifacts/1.0.2/skills/deep-research-harness/",
+  "memory_arn": "arn:aws:bedrock-agentcore:us-east-1:131166810173:memory/deepresearch_e2e3_harness-IhrfLWA7Ua",
+  "dispatcher_log_group": "/ecs/deepresearch-e2e3/dispatcher"
+}
